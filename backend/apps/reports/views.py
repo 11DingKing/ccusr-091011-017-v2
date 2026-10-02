@@ -14,6 +14,15 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from apps.core.response import success_response, error_response
 from apps.warehouse.models import Goods, StockIn, StockOut, Warning
 from .models import DailyReport
+from .export_service import (
+    CursorError,
+    ExportValidationError,
+    build_manifest,
+    create_export,
+    get_chunk,
+    parse_params,
+    resolve_cursor,
+)
 
 logger = logging.getLogger('apps')
 
@@ -324,3 +333,102 @@ class SystemMonitorView(APIView):
                 'process_count': process_count
             }
         })
+
+
+# ==================== 固定快照的分块导出 ====================
+
+class SnapshotExportPermission(IsAuthenticated):
+    """仅管理员（admin / superadmin）可新建监管导出任务。"""
+
+    def has_permission(self, request, view):
+        if not super().has_permission(request, view):
+            return False
+        return bool(getattr(request.user, 'is_admin', False))
+
+
+class SnapshotExportCreateView(APIView):
+    """
+    创建固定快照的分块导出。
+
+    首请求（POST）：按 type/start_date/end_date/chunk_size 冻结快照，
+    返回清单摘要（文件、分块、总数、校验值）与游标 cursor。
+    权限只在此处校验：权限变化只影响能否新建导出，不影响既有快照的继续下载。
+    """
+    permission_classes = [SnapshotExportPermission]
+
+    def post(self, request):
+        try:
+            dataset_keys, start_date, end_date, chunk_size = parse_params(request.data)
+        except ExportValidationError as exc:
+            return error_response(message=str(exc), code=400)
+
+        job, cursor = create_export(request.user, dataset_keys, start_date, end_date, chunk_size)
+        manifest = build_manifest(job, cursor)
+
+        logger.info(
+            "Snapshot export created: job=%s dataset=%s rows=%s chunks=%s by=%s",
+            job.id, job.dataset, job.total_rows, job.total_chunks, request.user.username,
+        )
+        return success_response(data=manifest, message='导出快照已创建')
+
+
+class SnapshotExportManifestView(APIView):
+    """
+    查询导出清单（GET）。必须携带创建时签发的 cursor；只能继续该快照，
+    快照过期后明确拒绝（410）。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        cursor = request.query_params.get('cursor', '')
+        try:
+            job = resolve_cursor(cursor, request.user)
+        except CursorError as exc:
+            return _cursor_error_response(exc)
+        return success_response(data=build_manifest(job, cursor))
+
+
+class SnapshotExportChunkView(APIView):
+    """
+    下载指定分块（GET）。重复下载同一分块返回字节一致的 XLSX，
+    并通过 ETag / X-Checksum-Sha256 暴露相同的 SHA-256 校验值。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, file_index, chunk_index):
+        cursor = request.query_params.get('cursor', '')
+        try:
+            job = resolve_cursor(cursor, request.user)
+        except CursorError as exc:
+            return _cursor_error_response(exc)
+
+        chunk = get_chunk(job, file_index, chunk_index)
+        if chunk is None:
+            return error_response(message='分块不存在，请按清单中的 file_index / chunk_index 请求', code=404)
+
+        content = bytes(chunk.content)
+        response = HttpResponse(
+            content,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        filename = _chunk_filename(job, file_index, chunk_index)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response['Content-Length'] = str(len(content))
+        response['X-Checksum-Sha256'] = chunk.checksum
+        response['ETag'] = f'"{chunk.checksum}"'
+        return response
+
+
+def _chunk_filename(job, file_index, chunk_index):
+    spec = next((f for f in job.file_specs if f['file_index'] == file_index), None)
+    base = spec['filename'] if spec else f'export_{file_index}.xlsx'
+    stem, _, ext = base.rpartition('.')
+    return f'{stem}_part{chunk_index}.{ext or "xlsx"}'
+
+
+def _cursor_error_response(exc):
+    if exc.kind == 'expired':
+        return error_response(message=str(exc), code=410)
+    if exc.kind == 'not_found':
+        return error_response(message=str(exc), code=404)
+    return error_response(message=str(exc), code=400)

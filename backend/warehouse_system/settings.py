@@ -38,6 +38,17 @@ DATABASES = {
         "OPTIONS": {"timeout": 20},
     }
 }
+
+
+def _enable_sqlite_wal(sender, connection, **kwargs):
+    # WAL：导出持有读快照期间不阻塞新记录写入
+    if connection.vendor == "sqlite":
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+
+
+from django.db.backends.signals import connection_created  # noqa: E402
+connection_created.connect(_enable_sqlite_wal)
 AUTH_PASSWORD_VALIDATORS = []
 AUTH_USER_MODEL = "authentication.User"
 LANGUAGE_CODE = "zh-hans"
@@ -60,6 +71,8 @@ REST_FRAMEWORK = {
 JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "local-custody-jwt-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DELTA = timedelta(hours=24)
+# 分块导出快照的有效期（分钟）：过期后游标与分块下载一律返回 410
+EXPORT_SNAPSHOT_TTL_MINUTES = int(os.environ.get("EXPORT_SNAPSHOT_TTL_MINUTES", 120))
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 LOGS_DIR = BASE_DIR / "logs"

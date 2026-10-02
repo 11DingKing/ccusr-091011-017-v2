@@ -109,3 +109,21 @@ def clean_old_logs():
     ).delete()
     
     logger.info(f"日志清理完成，删除记录: {deleted_count} 条")
+
+
+def cleanup_expired_exports():
+    """
+    清理过期的分块导出 - 定时任务
+    每小时执行一次，删除已过期的导出任务及其冻结分块，回收存储空间。
+    过期判定后任务状态会先置为 expired（下载侧随即返回 410）。
+    """
+    from django.utils import timezone
+    from .models import ExportJob
+
+    logger.info("开始清理过期的分块导出...")
+
+    now = timezone.now()
+    # 过期任务已在下载侧通过 410 拒绝；这里直接级联删除任务与冻结分块回收空间，
+    # 删除后旧游标再请求会得到 404（任务不存在或已被清理）。
+    deleted, _ = ExportJob.objects.filter(expires_at__lt=now).delete()
+    logger.info(f"过期导出清理完成，删除记录: {deleted} 条")
