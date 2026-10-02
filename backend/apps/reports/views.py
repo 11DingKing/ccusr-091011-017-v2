@@ -5,15 +5,18 @@ import logging
 import os
 import shutil
 from datetime import datetime, timedelta
+from urllib.parse import quote
+
 from django.db.models import Sum, Count, Q, F
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-from apps.core.response import success_response, error_response
+from apps.core.response import success_response, created_response, error_response
 from apps.warehouse.models import Goods, StockIn, StockOut, Warning
 from .models import DailyReport
+from . import export_service
 
 logger = logging.getLogger('apps')
 
@@ -191,8 +194,13 @@ class ExportView(APIView):
                 cell.border = thin_border
             
             # 数据
-            goods_list = Goods.objects.select_related('variety', 'variety__category', 'unit').filter(is_active=True)
+            goods_list = Goods.objects.select_related(
+                'variety', 'variety__category', 'variety__category__unit'
+            ).filter(is_active=True)
             for goods in goods_list:
+                unit_name = ''
+                if goods.variety and goods.variety.category and goods.variety.category.unit:
+                    unit_name = goods.variety.category.unit.name
                 ws.append([
                     goods.code,
                     goods.name,
@@ -200,7 +208,7 @@ class ExportView(APIView):
                     goods.variety.name if goods.variety else '',
                     goods.specification,
                     float(goods.quantity),
-                    goods.unit.name if goods.unit else '',
+                    unit_name,
                     goods.location,
                     float(goods.warning_threshold)
                 ])
@@ -219,13 +227,19 @@ class ExportView(APIView):
                 cell.alignment = header_alignment
                 cell.border = thin_border
             
-            stock_ins = StockIn.objects.select_related('goods', 'goods__unit', 'operator').all()
+            stock_ins = StockIn.objects.select_related(
+                'goods', 'goods__variety__category__unit', 'operator'
+            ).all()
             for record in stock_ins:
+                goods = record.goods
+                unit_name = ''
+                if goods and goods.variety and goods.variety.category and goods.variety.category.unit:
+                    unit_name = goods.variety.category.unit.name
                 ws.append([
-                    record.goods.code,
-                    record.goods.name,
+                    goods.code if goods else '',
+                    goods.name if goods else '',
                     float(record.quantity),
-                    record.goods.unit.name if record.goods.unit else '',
+                    unit_name,
                     record.batch_no,
                     record.supplier,
                     record.operator.username if record.operator else '',
@@ -246,13 +260,19 @@ class ExportView(APIView):
                 cell.alignment = header_alignment
                 cell.border = thin_border
             
-            stock_outs = StockOut.objects.select_related('goods', 'goods__unit', 'operator').all()
+            stock_outs = StockOut.objects.select_related(
+                'goods', 'goods__variety__category__unit', 'operator'
+            ).all()
             for record in stock_outs:
+                goods = record.goods
+                unit_name = ''
+                if goods and goods.variety and goods.variety.category and goods.variety.category.unit:
+                    unit_name = goods.variety.category.unit.name
                 ws.append([
-                    record.goods.code,
-                    record.goods.name,
+                    goods.code if goods else '',
+                    goods.name if goods else '',
                     float(record.quantity),
-                    record.goods.unit.name if record.goods.unit else '',
+                    unit_name,
                     record.receiver,
                     record.receiver_dept,
                     record.get_status_display(),
@@ -324,3 +344,91 @@ class SystemMonitorView(APIView):
                 'process_count': process_count
             }
         })
+
+
+# ==================== 固定快照分块导出 ====================
+
+class SnapshotExportCreateView(APIView):
+    """
+    创建快照导出任务。
+
+    POST /api/exports/
+    参数：type=stock_in|stock_out|approval|all（默认 all），
+         start_date、end_date（默认最近30天），chunk_size（默认1000）。
+    返回清单摘要与游标 cursor；数据在创建时即冻结。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        export_type = request.data.get('type') or request.query_params.get('type') or 'all'
+        params = {
+            'start_date': request.data.get('start_date') or request.query_params.get('start_date'),
+            'end_date': request.data.get('end_date') or request.query_params.get('end_date'),
+            'chunk_size': request.data.get('chunk_size') or request.query_params.get('chunk_size'),
+        }
+        job = export_service.create_export_job(request.user, export_type, params)
+        logger.info(
+            "Export snapshot created: job=%s type=%s rows=%s chunks=%s by user=%s",
+            job.id, job.export_type, job.total_rows, job.total_chunks, request.user.username
+        )
+        return created_response(
+            data=export_service.build_manifest(job),
+            message='导出快照已创建，请凭游标分块下载'
+        )
+
+
+class SnapshotExportStatusView(APIView):
+    """
+    查询快照清单与各分块下载状态（校验值、字节数）。
+    GET /api/exports/status/?cursor=...
+    只返回创建时固化的清单及已渲染分块的元数据，不回源业务表。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        job = export_service.get_accessible_job(
+            request.query_params.get('cursor'), request.user
+        )
+        manifest = export_service.build_manifest(job)
+        manifest['status'] = job.status
+        manifest['chunks'] = export_service.build_chunk_state(job)
+        return success_response(data=manifest)
+
+
+class SnapshotExportChunkView(APIView):
+    """
+    下载快照的某个分块。
+    GET /api/exports/chunks/?cursor=...&chunk=0
+    同一 (cursor, chunk) 重复下载返回完全相同的字节、文件名与 SHA256；
+    快照过期返回 410，游标无效或非本人返回 404。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        job = export_service.get_accessible_job(
+            request.query_params.get('cursor'), request.user
+        )
+        chunk_index = export_service.get_chunk_index(job, request.query_params)
+        chunk, created = export_service.get_or_build_chunk(job, chunk_index)
+        if created:
+            logger.info(
+                "Export chunk rendered: job=%s chunk=%s rows=%s checksum=%s",
+                job.id, chunk.chunk_index, chunk.row_count, chunk.checksum
+            )
+
+        content = bytes(chunk.content)
+        filename = quote(chunk.file_name)
+        response = HttpResponse(
+            content,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f"attachment; filename*=UTF-8''{filename}"
+        response['Content-Length'] = str(len(content))
+        response['X-Export-Cursor'] = job.cursor_token
+        response['X-Chunk-Index'] = str(chunk.chunk_index)
+        response['X-Total-Chunks'] = str(job.total_chunks)
+        response['X-Row-Count'] = str(chunk.row_count)
+        response['X-Content-SHA256'] = chunk.checksum
+        response['ETag'] = f'"{chunk.checksum}"'
+        response['Cache-Control'] = 'no-store'
+        return response

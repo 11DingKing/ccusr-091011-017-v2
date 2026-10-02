@@ -6,7 +6,9 @@ from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
 from apps.authentication.backends import generate_token
 from apps.authentication.models import User
-from apps.warehouse.models import Category, Goods, Unit, Variety, Warning
+from apps.warehouse.models import (
+    Category, Goods, StockIn, StockOut, Unit, Variety, Warning,
+)
 from .cron import check_stock_warning
 from .models import DailyReport
 from .views import DashboardView
@@ -50,6 +52,29 @@ class ReportTest(TestCase):
     def test_invalid_export_type(self):
         response = self.client.get("/api/export/", {"type": "unknown"})
         self.assertEqual(response.status_code, 400)
+
+    def test_export_goods_with_data(self):
+        response = self.client.get("/api/export/", {"type": "goods"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response["Content-Type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    def test_export_stock_in_out_with_data(self):
+        StockIn.objects.create(
+            goods=self.goods, operator=self.user,
+            quantity=Decimal("3"), batch_no="B1", supplier="供应商",
+        )
+        stock_out = StockOut.objects.create(
+            goods=self.goods, operator=self.user,
+            receiver="张三", receiver_dept="检查组",
+            quantity=Decimal("1"), status="completed",
+        )
+        for export_type in ("stock_in", "stock_out"):
+            response = self.client.get("/api/export/", {"type": export_type})
+            self.assertEqual(response.status_code, 200, export_type)
+            self.assertTrue(response.content.startswith(b"PK"))
 
     def test_system_monitor_shape(self):
         response = self.client.get("/api/system-monitor/")

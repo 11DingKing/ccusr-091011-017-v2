@@ -109,3 +109,19 @@ def clean_old_logs():
     ).delete()
     
     logger.info(f"日志清理完成，删除记录: {deleted_count} 条")
+
+
+def cleanup_expired_exports():
+    """
+    清理过期导出快照 - 定时任务
+    每小时执行一次，删除过期 ExportJob（级联删除冻结行与已渲染分块）。
+    """
+    from django.utils import timezone
+    from .models import ExportJob
+
+    logger.info("开始执行过期导出快照清理...")
+    expired = ExportJob.objects.filter(expires_at__lt=timezone.now())
+    count = expired.count()
+    if count:
+        expired.delete()
+    logger.info(f"过期导出快照清理完成，删除任务: {count} 个")

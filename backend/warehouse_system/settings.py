@@ -60,6 +60,8 @@ REST_FRAMEWORK = {
 JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "local-custody-jwt-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DELTA = timedelta(hours=24)
+# 导出快照默认有效期（秒）：过期后游标一律被拒绝，需重新创建导出
+EXPORT_SNAPSHOT_TTL_SECONDS = int(os.environ.get("EXPORT_SNAPSHOT_TTL_SECONDS", "3600"))
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 LOGS_DIR = BASE_DIR / "logs"

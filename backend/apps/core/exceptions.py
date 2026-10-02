@@ -37,6 +37,12 @@ class NotFoundException(BusinessException):
         super().__init__(message, code=404)
 
 
+class SnapshotExpiredException(BusinessException):
+    """快照已过期异常"""
+    def __init__(self, message="数据快照已过期"):
+        super().__init__(message, code=410)
+
+
 def custom_exception_handler(exc, context):
     """
     自定义异常处理器
